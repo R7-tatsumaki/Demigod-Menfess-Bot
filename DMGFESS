@@ -1,0 +1,194 @@
+import time
+import datetime
+import pytz
+import json
+import os
+import asyncio
+import re
+import random
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.constants import ParseMode, ChatMemberStatus
+
+# ================= KONFIGURASI AWAL =================
+TOKEN_BOT = 'ISI_TOKEN_BOT_KAMU'
+ID_OWNER = 12345678  # Ganti dengan ID Telegram kamu (Cek di @userinfobot)
+DB_FILE = "database_menfess.json"
+START_TIME = time.time()
+# ===================================================
+
+def load_db():
+    default = {
+        "config": {"id_logs": None, "id_autopost": None, "fsub": {}},
+        "blacklist": {}, "mute": {}, "stats": {}
+    }
+    if not os.path.exists(DB_FILE): return default
+    try:
+        with open(DB_FILE, "r") as f:
+            data = json.load(f)
+            for k in default: 
+                if k not in data: data[k] = default[k]
+            return data
+    except: return default
+
+def save_db(data):
+    with open(DB_FILE, "w") as f: json.dump(data, f, indent=4)
+
+db = load_db()
+
+# --- FUNGSI ADMIN KONFIGURASI (LOGS, AUTOPOST, FSUB) ---
+async def set_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ID_OWNER: return
+    cmd = update.message.text.split()
+    if len(cmd) < 2: 
+        return await update.message.reply_text("Format: <code>/addlogs -100xxx</code> atau <code>/addfsub -100xxx</code>", parse_mode=ParseMode.HTML)
+    
+    action = cmd[0].lower()
+    try:
+        target_id = int(cmd[1])
+        # CEK APAKAH BOT SUDAH JADI ADMIN
+        bot_member = await context.bot.get_chat_member(target_id, context.bot.id)
+        if bot_member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
+            return await update.message.reply_text("❌ Gagal! Jadikan bot sebagai ADMIN dulu di channel tersebut.")
+        
+        chat = await context.bot.get_chat(target_id)
+        chat_name = chat.title
+        
+        if action == "/addlogs":
+            db["config"]["id_logs"] = target_id
+            msg = f"✅ <b>Logs diatur ke:</b> {chat_name} (<code>{target_id}</code>)"
+        elif action == "/addautopost":
+            db["config"]["id_autopost"] = target_id
+            msg = f"✅ <b>Autopost diatur ke:</b> {chat_name} (<code>{target_id}</code>)"
+        elif action == "/addfsub":
+            if len(db["config"]["fsub"]) >= 4:
+                return await update.message.reply_text("❌ Maksimal 4 FSub agar tombol tetap rapi.")
+            db["config"]["fsub"][str(target_id)] = chat_name
+            msg = f"✅ <b>FSub ditambah:</b> {chat_name} (<code>{target_id}</code>)"
+        
+        save_db(db)
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: Pastikan ID benar dan bot sudah di dalam channel.\nLog: {e}")
+
+async def del_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ID_OWNER: return
+    cmd = update.message.text.split()
+    action = cmd[0].lower()
+
+    if action == "/dellogs": db["config"]["id_logs"] = None
+    elif action == "/delautopost": db["config"]["id_autopost"] = None
+    elif action == "/delfsub":
+        if len(cmd) < 2: return await update.message.reply_text("Sebutkan ID Channel yang mau dihapus dari FSub.")
+        db["config"]["fsub"].pop(cmd[1], None)
+    
+    save_db(db)
+    await update.message.reply_text(f"🗑️ Berhasil menghapus/reset konfigurasi {action}.")
+
+# --- STATUS PANEL ---
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ID_OWNER: return
+    cfg = db["config"]
+    
+    # Ambil daftar nama FSub
+    fsub_list = []
+    for cid, name in cfg["fsub"].items():
+        fsub_list.append(f"• {name} (<code>{cid}</code>)")
+    fsub_display = "\n".join(fsub_list) if fsub_list else "<i>Belum ada</i>"
+
+    uptime = str(datetime.timedelta(seconds=int(time.time() - START_TIME)))
+    
+    text = (
+        f"📊 <b>DEMIGOD SYSTEM STATUS</b>\n"
+        f"<code>----------------------------</code>\n"
+        f"📢 <b>Autopost:</b> {cfg['id_autopost'] or '❌'}\n"
+        f"📑 <b>Logs:</b> {cfg['id_logs'] or '❌'}\n\n"
+        f"🛡️ <b>FSub Channels:</b>\n{fsub_display}\n"
+        f"<code>----------------------------</code>\n"
+        f"👥 Users: {len(db['stats'])}\n"
+        f"🚫 Banned: {len(db['blacklist'])}\n"
+        f"⏳ Uptime: {uptime}\n"
+        f"<code>----------------------------</code>"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+# --- FUNGSI CEK FSUB ---
+async def check_fsub(user_id, context):
+    not_joined = []
+    for cid_str, name in db["config"]["fsub"].items():
+        try:
+            member = await context.bot.get_chat_member(int(cid_str), user_id)
+            if member.status in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED]:
+                not_joined.append((cid_str, name))
+        except: not_joined.append((cid_str, name))
+    return not_joined
+
+# --- HANDLER UTAMA ---
+async def handle_menfess(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user, msg = update.effective_user, update.message
+    text = msg.text or msg.caption or ""
+    uid_str = str(user.id)
+    cfg = db["config"]
+
+    if text.startswith('/') or uid_str in db["blacklist"]: return
+    
+    # Cek apakah Admin sudah setting ID Logs & Autopost
+    if not cfg["id_autopost"] or not cfg["id_logs"]:
+        if user.id == ID_OWNER:
+            return await msg.reply_text("⚠️ Owner, silakan set <code>/addautopost</code> dan <code>/addlogs</code> dulu!", parse_mode=ParseMode.HTML)
+        return await msg.reply_text("⚠️ Bot sedang dalam perbaikan (ID belum diset).")
+
+    # Cek FSub
+    not_joined = await check_fsub(user.id, context)
+    if not_joined:
+        buttons = []
+        for cid, name in not_joined:
+            try:
+                chat = await context.bot.get_chat(int(cid))
+                link = chat.invite_link or f"https://t.me/{chat.username}"
+                buttons.append([InlineKeyboardButton(f"Join {name}", url=link)])
+            except: continue
+        return await msg.reply_text("❌ <b>AKSES DITOLAK</b>\nGabung channel sponsor untuk mengirim menfess:", 
+                                    reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML)
+
+    # Filter Tag Menfess
+    tags = ["#DgBoy", "#DgGirl", "#DgAsk", "#DgStory", "#DgCurhat", "#DgSpill"]
+    if any(t.lower() in text.lower() for t in tags):
+        try:
+            # Feedback proses
+            status_msg = await msg.reply_text("⏳ <i>Mengirim menfess...</i>", parse_mode=ParseMode.HTML)
+            
+            cap = f"<b>[ DEMIGOD MENFESS ]</b>\n\n{text}\n\n<b>ID:</b> #Gm{random.randint(1000, 9999)}"
+            
+            # Post ke Channel (Tanpa Watermark = RAM AMAN)
+            if msg.photo:
+                sent = await context.bot.send_photo(cfg["id_autopost"], photo=msg.photo[-1].file_id, caption=cap, parse_mode=ParseMode.HTML)
+            else:
+                sent = await context.bot.send_message(cfg["id_autopost"], cap, parse_mode=ParseMode.HTML)
+
+            # Kirim ke Logs Admin
+            await context.bot.send_message(cfg["id_logs"], f"👤 <b>SENDER LOG</b>\nUID: <code>{user.id}</code>\nUSER: {user.full_name}\n\n📝 DATA:\n{text}", parse_mode=ParseMode.HTML)
+            
+            await status_msg.delete()
+            await msg.reply_text("✅ <b>Terkirim!</b> Cek di channel menfess ya.")
+            
+            # Update Stats
+            db["stats"][uid_str] = db["stats"].get(uid_str, 0) + 1
+            save_db(db)
+        except Exception as e:
+            await msg.reply_text(f"❌ Gagal mengirim: {e}")
+
+if __name__ == '__main__':
+    app = ApplicationBuilder().token(TOKEN_BOT).build()
+    
+    # Admin & Config Handlers
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("stats", status_cmd)) # Shortcut
+    for c in ["addlogs", "addautopost", "addfsub"]: app.add_handler(CommandHandler(c, set_config))
+    for c in ["dellogs", "delautopost", "delfsub"]: app.add_handler(CommandHandler(c, del_config))
+    
+    # Menfess Handler
+    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & (~filters.COMMAND), handle_menfess))
+    
+    print("DEMIGOD MENFESS ACTIVE🚀!")
+    app.run_polling()
